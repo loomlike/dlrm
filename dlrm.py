@@ -1,7 +1,6 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-import sys  # TODO replace w/ raise Exception
 from typing import Any, Dict, Iterable
 import warnings
 
@@ -34,56 +33,7 @@ import extend_distributed as ext_dist
 import optim.rwsadagrad as RowWiseSparseAdagrad
 
 
-# TODO convert dash_separated_ints, dash_separated_floats to list
-
 def run():
-
-    ### construct the neural network specified above ###
-    # WARNING: to obtain exactly the same initialization for
-    # the weights we need to start from the same random seed.
-    # np.random.seed(args.numpy_rand_seed)
-    global dlrm
-    dlrm = DLRM_Net(
-        m_spa,
-        ln_emb,
-        ln_bot,
-        ln_top,
-        arch_interaction_op=args.arch_interaction_op,
-        arch_interaction_itself=args.arch_interaction_itself,
-        sigmoid_bot=-1,
-        sigmoid_top=ln_top.size - 2,
-        sync_dense_params=args.sync_dense_params,
-        loss_threshold=args.loss_threshold,
-        ndevices=ndevices,
-        qr_flag=args.qr_flag,
-        qr_operation=args.qr_operation,
-        qr_collisions=args.qr_collisions,
-        qr_threshold=args.qr_threshold,
-        md_flag=args.md_flag,
-        md_threshold=args.md_threshold,
-        weighted_pooling=args.weighted_pooling,
-    )
-
-    # test prints
-    if args.debug_mode:
-        print("initial parameters (weights and bias):")
-        for param in dlrm.parameters():
-            print(param.detach().cpu().numpy())
-        # print(dlrm)
-
-    if use_gpu:
-        # Custom Model-Data Parallel
-        # the mlps are replicated and use data parallelism, while
-        # the embeddings are distributed and use model parallelism
-        dlrm = dlrm.to(device)  # .cuda()
-        if dlrm.ndevices > 1:
-            dlrm.emb_l, dlrm.v_W_l = dlrm.create_emb(
-                m_spa, ln_emb, args.weighted_pooling
-            )
-        else:
-            if dlrm.weighted_pooling == "fixed":
-                for k, w in enumerate(dlrm.v_W_l):
-                    dlrm.v_W_l[k] = w.cuda()
 
     # distribute data parallel mlps
     if ext_dist.my_size > 1:
@@ -423,6 +373,7 @@ def run():
 
 # TODO
 class DLRM:
+    # TODO maybe use kwargs and pass to DLRM_NET if these params are too much? 
     def __init__(
         self,
 
@@ -445,6 +396,25 @@ class DLRM:
         qr_operation: str = None,  # if None, don't use. {'mult', 'concat'} TODO anything else???
         qr_threshold: int = 200,
         qr_collisions: int = 4,
+        qr_flag: bool = False,
+
+        # embedding table options
+        md_threshold: int = 200,
+        md_temperature: float = 0.3,
+        md_round_dims: bool = False,
+        md_flag: bool = False,
+
+        weighted_pooling: str = None,  # either "fixed" or "learned"
+
+        # quantize
+        quantize_mlp_with_bit: int = 32,
+        quantize_emb_with_bit: int = 32,
+
+        sync_dense_params: bool = True,
+        loss_threshold: float = 0.0, 
+
+        loss_function: str = 'mse',  # or 'bce' or 'wbce'
+        loss_weights: Iterable[float] = (1.0, 1.0,),  # for wbce
 
         # random seed
         seed: int = None,
@@ -462,20 +432,11 @@ class DLRM:
         # model related parameters
 
         # j will be replaced with the table number
-        parser.add_argument("--weighted-pooling", type=str, default=None)
-        # embedding table options
-        parser.add_argument("--md-flag", action="store_true", default=False)
-        parser.add_argument("--md-threshold", type=int, default=200)
-        parser.add_argument("--md-temperature", type=float, default=0.3)
-        parser.add_argument("--md-round-dims", action="store_true", default=False)
+
 
         # activations and loss
         parser.add_argument("--activation-function", type=str, default="relu")
-        parser.add_argument("--loss-function", type=str, default="mse")  # or bce or wbce
-        parser.add_argument(
-            "--loss-weights", type=dash_separated_floats, default="1.0-1.0"
-        )  # for wbce
-        parser.add_argument("--loss-threshold", type=float, default=0.0)  # 1.0e-7
+
         parser.add_argument("--round-targets", type=bool, default=False)
         # data
         parser.add_argument("--data-size", type=int, default=1)
@@ -505,7 +466,6 @@ class DLRM:
         parser.add_argument("--mini-batch-size", type=int, default=1)
         parser.add_argument("--nepochs", type=int, default=1)
         parser.add_argument("--learning-rate", type=float, default=0.01)
-        parser.add_argument("--sync-dense-params", type=bool, default=True)
         parser.add_argument("--optimizer", type=str, default="sgd")
         parser.add_argument(
             "--dataset-multiprocessing",
@@ -518,9 +478,7 @@ class DLRM:
         )
         # inference
         parser.add_argument("--inference-only", action="store_true", default=False)
-        # quantize
-        parser.add_argument("--quantize-mlp-with-bit", type=int, default=32)
-        parser.add_argument("--quantize-emb-with-bit", type=int, default=32)
+
 
         # debugging and profiling
         parser.add_argument("--print-freq", type=int, default=1)
@@ -535,22 +493,22 @@ class DLRM:
         parser.add_argument("--lr-num-warmup-steps", type=int, default=0)
         parser.add_argument("--lr-decay-start-step", type=int, default=0)
         parser.add_argument("--lr-num-decay-steps", type=int, default=0)
-        if args.weighted_pooling is not None:
-            if args.qr_flag:
-                sys.exit("ERROR: quotient remainder with weighted pooling is not supported")
-            if args.md_flag:
-                sys.exit("ERROR: mixed dimensions with weighted pooling is not supported")
-        if args.quantize_emb_with_bit in [4, 8]:
-            if args.qr_flag:
-                sys.exit(
-                    "ERROR: 4 and 8-bit quantization with quotient remainder is not supported"
-                )
-            if args.md_flag:
-                sys.exit(
-                    "ERROR: 4 and 8-bit quantization with mixed dimensions is not supported"
-                )
+        
 
         """
+        if weighted_pooling is not in {None, 'fixed', 'learned'}:
+            raise ValueError("Weighted pooling should be either None, 'fixed' or 'learned'")
+        if weighted_pooling is not None:
+            if qr_flag:
+                raise ValueError("Quotient remainder with weighted pooling is not supported")
+            if md_flag:
+                raise ValueError("Mixed dimensions with weighted pooling is not supported")
+        if quantize_emb_with_bit in {4, 8}:
+            if qr_flag:
+                raise ValueError("4 and 8-bit quantization with quotient remainder is not supported")
+            if md_flag:
+                raise ValueError("ERROR: 4 and 8-bit quantization with mixed dimensions is not supported")
+
         np.random.seed(seed)
         torch.manual_seed(seed)
 
@@ -581,18 +539,16 @@ class DLRM:
             backend=dist_backend,
         )
 
-        # Quotient-Remainder parameters
-        self.qr_operation = qr_operation
-        self.qr_threshold = qr_threshold
-        self.qr_collisions = qr_collisions
-
         ##### Model architecture
         # Bottom MLP
         self.m_den = arch_dense_feature_size
         self.m_spa = arch_sparse_feature_size  # Sparse feature embedding output size)
-        if self.qr_operation == "concat":
+        if qr_flag:
+        if qr_operation == "concat":
+            # The last dim of bottom mlp must match 2x the embedding dim
             self.ln_bot = np.array([self.m_den] + list(arch_mlp_bot_hiddens) + [2 * self.m_spa])
         else:
+            # The last dim of bottom mlp must match the embedding dim
             self.ln_bot = np.array([self.m_den] + list(arch_mlp_bot_hiddens) + [self.m_spa])
 
         # Embedding tables for sparse features
@@ -600,6 +556,15 @@ class DLRM:
 
         # Number of features = number of sparse features + 1 dense feature
         self.num_fea = len(self.ln_emb) + 1
+
+        # Assign mixed dimensions if applicable
+        if md_flag:
+            self.m_spa = md_solver(
+                torch.tensor(self.ln_emb),
+                md_temperature,  # alpha
+                d0=self.m_spa,
+                round_dim=md_round_dims,
+            ).tolist()
 
         # Top MLP
         m_den_out = self.ln_bot[-1]
@@ -614,30 +579,42 @@ class DLRM:
             raise ValueError(f"ERROR: unknown arch_interaction_op: {arch_interaction_op}")
         self.ln_top = np.array([num_int] + list(arch_mlp_top))
 
+        # Construct the neural network. Use the original implementation of FBR
+        # except args.loss_function and args.loss_weight
+        self.dlrm = DLRM_Net(
+            m_spa=self.m_spa,
+            ln_emb=self.ln_emb,
+            ln_bot=self.ln_bot,
+            ln_top=self.ln_top,
+            arch_interaction_op=arch_interaction_op,
+            arch_interaction_itself=arch_interaction_itself,
+            sigmoid_bot=-1,
+            sigmoid_top=self.ln_top.size-2,
+            sync_dense_params=sync_dense_params,
+            loss_threshold=loss_threshold,
+            ndevices=self.ndevices,
+            qr_flag=qr_flag,
+            qr_operation=qr_operation,
+            qr_collisions=qr_collisions,
+            qr_threshold=qr_threshold,
+            md_flag=md_flag,
+            md_threshold=md_threshold,
+            weighted_pooling=weighted_pooling,
+        )
 
-
-
-        # TODO:
-        # self.train_ld
-
-        # self.nbatches
-
-        # self.mini_batch_size
-        # self.num_workers
-
-
-
-
-
-
-        # assign mixed dimensions if applicable: TODO...
-        if args.md_flag:
-            m_spa = md_solver(
-                torch.tensor(ln_emb),
-                args.md_temperature,  # alpha
-                d0=m_spa,
-                round_dim=args.md_round_dims,
-            ).tolist()
+        if self.use_gpu:
+            # Custom Model-Data Parallel
+            # the mlps are replicated and use data parallelism, while
+            # the embeddings are distributed and use model parallelism
+            self.dlrm = self.dlrm.to(self.device)
+            if self.ndevices > 1:
+                self.dlrm.emb_l, self.dlrm.v_W_l = self.dlrm.create_emb(
+                    self.m_spa, self.ln_emb, weighted_pooling
+                )
+            else:
+                if weighted_pooling == 'fixed':
+                    for k, w in enumerate(self.dlrm.v_W_l):
+                        self.dlrm.v_W_l[k] = w.cuda()
 
     def fit(
         self,
@@ -844,3 +821,8 @@ class DLRM:
             print([S_i.detach().cpu() for S_i in lS_i])
             print(T.detach().cpu())
 
+    def summary_params(self):
+        """Print model parameters"""
+        print("Parameters (weights and bias):")
+        for param in self.dlrm.parameters():
+            print(param.detach().cpu().numpy())

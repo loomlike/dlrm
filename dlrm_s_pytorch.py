@@ -192,6 +192,7 @@ class LRPolicyScheduler(_LRScheduler):
 
 
 ### define dlrm in PyTorch ###
+# Note: args.loss_function and args.loss_weight has been changed to use member vars
 class DLRM_Net(nn.Module):
     def create_mlp(self, ln, sigmoid_layer):
         # build MLP layer by layer
@@ -301,6 +302,8 @@ class DLRM_Net(nn.Module):
         md_flag=False,
         md_threshold=200,
         weighted_pooling=None,
+        loss_function=None,
+        loss_weight=None,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -369,18 +372,16 @@ class DLRM_Net(nn.Module):
             self.quantize_bits = 32
 
             # specify the loss function
-            if args.loss_function == "mse":
+            if loss_function == "mse":
                 self.loss_fn = torch.nn.MSELoss(reduction="mean")
-            elif args.loss_function == "bce":
+            elif loss_function == "bce":
                 self.loss_fn = torch.nn.BCELoss(reduction="mean")
-            elif args.loss_function == "wbce":
-                self.loss_ws = torch.tensor(
-                    np.fromstring(args.loss_weights, dtype=float, sep="-")
-                )
+            elif loss_function == "wbce":
+                self.loss_ws = torch.tensor(loss_weights)
                 self.loss_fn = torch.nn.BCELoss(reduction="none")
             else:
                 sys.exit(
-                    "ERROR: --loss-function=" + args.loss_function + " is not supported"
+                    "ERROR: --loss-function=" + loss_function + " is not supported"
                 )
 
     def apply_mlp(self, x, layers):
